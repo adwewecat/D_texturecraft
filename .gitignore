@@ -1,0 +1,17 @@
+*~
+plan/
+/target
+target/
+/dist
+/corpus
+/log
+/secrets
+/temp
+# The shared nightly workflow checks these out into the workspace; `nightly_init` refuses a dirty tree.
+/.nightly-tools
+/.nightly-input
+/craft-fonts
+/craft-i18n
+__pycache__/
+*.pyc
+*.tcraft.tmp

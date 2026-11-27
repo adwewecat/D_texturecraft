@@ -1,0 +1,557 @@
+//! File I/O that works without paths. In the browser, File › Open is the browser's file picker and
+//! Save / Export are downloads; on the desktop, the same calls open native dialogs and run the
+//! path-based engine commands (`file.open`, `file.saveAs`, `file.exportTextures`).
+//!
+//! A browser pick is asynchronous: its bytes wait in an inbox until [`poll`] (called every frame)
+//! turns them into the session.
+
+use std::sync::{Mutex, PoisonError};
+
+use texturecraft_engine::Session;
+use texturecraft_engine::core::PROJECT_EXT;
+#[cfg(any(target_arch = "wasm32", test))]
+use texturecraft_engine::formats::ExportedFile;
+use texturecraft_engine::formats::export::sanitize_file_stem;
+use texturecraft_engine::formats::mesh_import::MESH_EXTENSIONS;
+
+use crate::TextureCraftApp;
+use crate::i18n::{tr, trf};
+
+/// What File › Open accepts: projects and meshes.
+pub const OPEN_EXTS: &[&str] = &[PROJECT_EXT, "glb", "gltf", "fbx", "dae", "usd", "usda", "usdc", "usdz", "abc", "obj", "ply", "stl"];
+
+/// Images File › Import resources accepts.
+pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "tga", "tif", "tiff", "bmp", "webp", "exr", "hdr"];
+
+/// Equirect HDR images Display settings › Import HDR accepts.
+pub const ENV_EXTS: &[&str] = &["hdr", "exr"];
+
+/// Materials File › Import material adds as layers: smart materials, MaterialCraft portable
+/// materials and MaterialCraft packages.
+pub const MATERIAL_EXTS: &[&str] = &["tcmat", "mcmat", "mcraft"];
+
+/// Texture size of a project made from an opened mesh (smaller on the single-threaded web).
+const MESH_RESOLUTION: u32 = if cfg!(target_arch = "wasm32") { 1024 } else { 2048 };
+
+/// What a picked file is for; project-bound picks carry their originating project id.
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+enum Pick {
+    /// File > Open / a dropped file: a project, a mesh or an image resource.
+    Open,
+    /// Display settings > Import HDR.
+    Environment(u64),
+    /// Bake mode: a high-definition mesh.
+    HighPoly(u64),
+    /// Bake mode: the cage mesh.
+    Cage(u64),
+    /// Export dialog › Output templates: an export template (`.json`).
+    ExportPreset,
+    /// New project › 3D mesh › Select...: the mesh the project is created from.
+    NewProjectMesh(u64),
+}
+
+/// Files picked in the browser, waiting for the next frame: (file name, bytes, purpose).
+static INBOX: Mutex<Vec<(String, Vec<u8>, Pick)>> = Mutex::new(Vec::new());
+
+/// Load files that arrived since the last frame. Call once per frame.
+pub fn poll(app: &mut TextureCraftApp) {
+    let picked = std::mem::take(&mut *INBOX.lock().unwrap_or_else(PoisonError::into_inner));
+    apply_picked(app, picked);
+}
+
+fn apply_picked(app: &mut TextureCraftApp, picked: Vec<(String, Vec<u8>, Pick)>) {
+    for (name, bytes, pick) in picked {
+        let done = match pick {
+            Pick::Open => {
+                load(app, &name, bytes);
+                continue;
+            }
+
+            // A late project-bound pick must not modify the placeholder or a replacement project
+            Pick::Environment(_) | Pick::HighPoly(_) | Pick::Cage(_) if !app.session.project_open => {
+                app.toast(tr("No project is open"), true);
+                continue;
+            }
+
+            Pick::Environment(project_id) | Pick::HighPoly(project_id) | Pick::Cage(project_id) if project_id != app.session.project_id => {
+                app.toast(tr("The project changed while the dialog was open, so nothing was done"), true);
+                continue;
+            }
+
+            Pick::Environment(_) => app.session.import_resource_bytes(&name, bytes).map(|res| use_environment(app, &res)),
+            Pick::HighPoly(_) => app.session.add_high_poly_bytes(&name, bytes).map(|n| app.toast(trf("High poly: {name}", &[("name", &n)]), false)),
+            Pick::Cage(_) => app.session.set_cage_bytes(&name, bytes).map(|n| app.toast(trf("Cage: {name}", &[("name", &n)]), false)),
+            Pick::NewProjectMesh(request_id) => {
+                if app.ui.windows.new_project && app.ui.new_project.mesh_request_id == request_id {
+                    app.ui.new_project.file = Some(name);
+                    app.ui.new_project.file_bytes = Some(std::sync::Arc::new(bytes));
+                }
+                continue;
+            }
+
+            Pick::ExportPreset => {
+                match texturecraft_engine::formats::preset_from_json(&String::from_utf8_lossy(&bytes)) {
+                    Ok(p) => crate::export_templates::import(app, &p),
+                    Err(e) => app.toast(trf("Couldn't import {name}: {error}", &[("name", &name), ("error", &e)]), true),
+                }
+                continue;
+            }
+        };
+        if let Err(e) = done {
+            app.toast(trf("Couldn't import {name}: {error}", &[("name", &name), ("error", &e)]), true);
+        }
+    }
+}
+
+/// Bake mode: add high polys (they load on a worker) or load the cage with the native file dialog, once it answers
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_bake_mesh(app: &mut TextureCraftApp, _ctx: &egui::Context, cage: bool) {
+    use crate::file_dialogs::{Bound, FileDialog};
+    let dialog = if cage { FileDialog::open() } else { FileDialog::open_many() };
+    app.ask_file(dialog.filter(tr("Meshes"), &MESH_EXTENSIONS), Bound::Project, move |app, paths| {
+        let mut paths = paths.iter().map(|path| path.display().to_string());
+        if !cage {
+            app.load_high_polys(paths);
+        } else if let Some(path) = paths.next() {
+            app.run("bake.cage.set", serde_json::json!({ "path": path }));
+        }
+    });
+}
+
+/// Display settings › Import HDR: pick an equirect `.hdr`/`.exr`, import it as a resource and
+/// light the scene with it, on a later frame when the dialog answers.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_environment(app: &mut TextureCraftApp, _ctx: &egui::Context) {
+    use crate::file_dialogs::{Bound, FileDialog};
+    app.ask_file(FileDialog::open().filter(tr("HDR environments"), ENV_EXTS), Bound::Project, |app, paths| {
+        let Some(p) = paths.first() else { return };
+        if let Some(r) = app.run("resource.import", serde_json::json!({ "path": p.display().to_string() }))
+            && let Some(name) = r.get("name").and_then(|n| n.as_str())
+        {
+            use_environment(app, name);
+        }
+    });
+}
+
+/// Make image resource `name` the environment.
+pub(crate) fn use_environment(app: &mut TextureCraftApp, name: &str) {
+    let env = format!("{}{name}", texturecraft_engine::core::project::ENV_RESOURCE_PREFIX);
+    if app.run("display.set", serde_json::json!({ "environment": env })).is_some() {
+        app.toast(trf("Environment: {name}", &[("name", &name)]), false);
+    }
+}
+
+/// Import an image as a project resource, or replace the session with a `.tcraft` project or a
+/// mesh file's bytes, after asking to save unsaved changes (errors become toasts).
+pub fn load(app: &mut TextureCraftApp, name: &str, bytes: Vec<u8>) {
+    let path = std::path::Path::new(name);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if (IMAGE_EXTS.contains(&ext.as_str()) || MATERIAL_EXTS.contains(&ext.as_str())) && !app.session.project_open {
+        app.toast(tr("No project is open"), true);
+        return;
+    }
+
+    if IMAGE_EXTS.contains(&ext.as_str()) {
+        match app.session.import_resource_bytes(name, bytes) {
+            Ok(res) => {
+                app.ui.dock.focus(crate::docking::Panel::Assets);
+                app.toast(trf("Imported {name}", &[("name", &res)]), false);
+            }
+            Err(e) => app.toast(trf("Couldn't import {name}: {error}", &[("name", &name), ("error", &e)]), true),
+        }
+        return;
+    }
+
+    if MATERIAL_EXTS.contains(&ext.as_str()) {
+        if let Err(e) = app.session.add_smart_material_bytes(&bytes) {
+            app.toast(trf("Couldn't import {name}: {error}", &[("name", &name), ("error", &e)]), true);
+        }
+        return;
+    }
+
+    let bytes = std::sync::Arc::new(bytes);
+    if crate::windows::ask_to_save(app, crate::state::Unsaved::Load(name.into(), bytes.clone())) {
+        return;
+    }
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
+    let next = if ext == PROJECT_EXT { Session::from_project_bytes(&bytes) } else { Session::from_mesh_bytes(name, &bytes, MESH_RESOLUTION, stem) };
+    match next {
+        Ok(next) => {
+            app.session.switch_to(next);
+            app.pbr_import = None;
+            app.resize = None;
+            app.layer_panel = Default::default();
+            app.toast(trf("Opened {name}", &[("name", &name)]), false);
+        }
+        Err(e) => app.toast(trf("Couldn't open {name}: {error}", &[("name", &name), ("error", &e)]), true),
+    }
+}
+
+/// A file dropped on the window: images import as resources, anything else opens.
+pub fn dropped(app: &mut TextureCraftApp, ctx: &egui::Context, file: &egui::DroppedFileHandle) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ctx;
+        let path = file.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let path = path.display().to_string();
+        if MATERIAL_EXTS.contains(&ext.as_str()) {
+            app.run("material.load", serde_json::json!({ "path": path }));
+        } else if IMAGE_EXTS.contains(&ext.as_str()) {
+            if let Some(r) = app.run("resource.import", serde_json::json!({ "path": path })) {
+                let name = r.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                app.ui.dock.focus(crate::docking::Panel::Assets);
+                app.toast(trf("Imported {name}", &[("name", &name)]), false);
+            }
+        } else {
+            crate::windows::open_path(app, &path);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = app;
+        let (file, ctx) = (file.clone(), ctx.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let name = file.path().display().to_string();
+            match file.bytes_async().await {
+                Ok(bytes) => INBOX.lock().unwrap_or_else(PoisonError::into_inner).push((name, bytes, Pick::Open)),
+                Err(e) => log::warn!("couldn't read dropped file {name}: {e}"),
+            }
+            ctx.request_repaint();
+        });
+    }
+}
+
+/// The project's download / suggested file name.
+pub fn project_file_name(app: &TextureCraftApp) -> String {
+    format!("{}.{PROJECT_EXT}", sanitize_file_stem(&app.session.doc.project.name))
+}
+
+/// Pack exported textures into one zip archive.
+#[cfg(any(target_arch = "wasm32", test))]
+fn zip_files(files: Vec<ExportedFile>) -> Result<Vec<u8>, String> {
+    let mut zip = craft_zip::Writer::new();
+    for f in files {
+        // add_with reserves ZIP64 headers up front, even for small entries.
+        zip.add_with(&f.name, craft_zip::Compression::Deflated, |out| out.write_all(&f.bytes)).map_err(|e| e.to_string())?;
+    }
+    zip.finish().map_err(|e| e.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub use web::{
+    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, open, open_sample_project,
+    pick_new_project_mesh, save_project, sync_unsaved, unsaved,
+};
+
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use super::*;
+    use serde_json::Value;
+    use wasm_bindgen::JsCast as _;
+
+    /// Whether the project has unsaved changes, for the page's `beforeunload` listener.
+    static UNSAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Refresh [`unsaved`] (once per frame).
+    pub fn sync_unsaved(app: &TextureCraftApp) {
+        UNSAVED.store(app.session.modified, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether closing or reloading the page would lose unsaved changes.
+    pub fn unsaved() -> bool {
+        UNSAVED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// File › Open: the browser's file picker; the file loads on a later frame (see [`poll`]).
+    pub fn open(ctx: &egui::Context) {
+        pick(ctx, tr("Projects and meshes"), OPEN_EXTS, false, Pick::Open);
+    }
+
+    /// File > Open Sample Project: choose a saved TextureCraft project.
+    pub fn open_sample_project(ctx: &egui::Context) {
+        pick(ctx, tr("TextureCraft project"), &[PROJECT_EXT], false, Pick::Open);
+    }
+
+    /// File › Import material: pick materials; they add as layers on a later frame.
+    pub fn import_material(ctx: &egui::Context) {
+        pick(ctx, tr("Materials"), MATERIAL_EXTS, true, Pick::Open);
+    }
+
+    /// File › Import resources: pick images; they import on a later frame.
+    pub fn import_images(ctx: &egui::Context) {
+        pick(ctx, tr("Images"), IMAGE_EXTS, true, Pick::Open);
+    }
+
+    /// Display settings › Import HDR: pick an equirect image; it becomes the environment on a
+    /// later frame.
+    pub fn import_environment(app: &mut TextureCraftApp, ctx: &egui::Context) {
+        pick(ctx, tr("HDR environments"), ENV_EXTS, false, Pick::Environment(app.session.project_id));
+    }
+
+    /// Bake mode: pick high-definition meshes (or the cage); they load on a later frame.
+    pub fn import_bake_mesh(app: &mut TextureCraftApp, ctx: &egui::Context, cage: bool) {
+        pick(ctx, tr("Meshes"), &MESH_EXTENSIONS, !cage, if cage { Pick::Cage(app.session.project_id) } else { Pick::HighPoly(app.session.project_id) });
+    }
+
+    /// Export dialog › Output templates › Import: pick a template; it is added on a later frame.
+    pub fn import_preset(ctx: &egui::Context) {
+        pick(ctx, tr("Export templates"), &["json"], false, Pick::ExportPreset);
+    }
+
+    /// New project › Select...: pick the mesh file; Create reads it once it has arrived.
+    pub fn pick_new_project_mesh(ctx: &egui::Context, request_id: u64) {
+        pick(ctx, tr("3D meshes"), &MESH_EXTENSIONS, false, Pick::NewProjectMesh(request_id));
+    }
+
+    fn pick(ctx: &egui::Context, filter: &'static str, exts: &'static [&'static str], multiple: bool, kind: Pick) {
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let dialog = rfd::AsyncFileDialog::new().add_filter(filter, exts);
+            let files = if multiple { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };
+            for file in files {
+                let bytes = file.read().await;
+                INBOX.lock().unwrap_or_else(PoisonError::into_inner).push((file.file_name(), bytes, kind));
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// File › Save: download the project as `<name>.tcraft`.
+    pub fn save_project(app: &mut TextureCraftApp) {
+        let name = project_file_name(app);
+        match app.session.to_project_bytes().map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
+            Ok(()) => {
+                app.session.modified = false;
+                app.session.log.info("Project", format!("Saved {name}"));
+                app.toast(trf("Downloaded {name}", &[("name", &name)]), false);
+            }
+            Err(e) => app.toast(trf("Couldn't save {name}: {error}", &[("name", &name), ("error", &e)]), true),
+        }
+    }
+
+    /// File › Export Mesh: download the working mesh as `ext`: `glb` or `usdz` with its
+    /// textures inside, else OBJ.
+    pub fn export_mesh(app: &mut TextureCraftApp, ext: &str) {
+        let name = format!("{}.{ext}", sanitize_file_stem(&app.session.doc.project.name));
+        let bytes = match ext {
+            "glb" => app.session.mesh_glb_bytes_with_normals(app.ui.mesh_recompute_normals),
+            "usdz" => app.session.mesh_usd_with_normals(texturecraft_engine::formats::UsdFormat::Usdz, app.ui.mesh_recompute_normals).map(|u| u.bytes),
+            _ => app.session.mesh_obj_bytes_with_normals(app.ui.mesh_recompute_normals),
+        };
+        match bytes.map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
+            Ok(()) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),
+            Err(e) => app.toast(trf("Couldn't export the mesh: {error}", &[("error", &e)]), true),
+        }
+    }
+
+    /// Export each texture set with its own `file.exportTextures` params (minus `dir`): one file
+    /// downloads as is, several as `<project>_textures.zip`.
+    pub fn export_textures(app: &mut TextureCraftApp, jobs: &[(usize, Value)]) {
+        match export(app, jobs) {
+            Ok(name) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),
+            Err(e) => app.toast(trf("Couldn't export textures: {error}", &[("error", &e)]), true),
+        }
+    }
+
+    fn export(app: &mut TextureCraftApp, jobs: &[(usize, Value)]) -> Result<String, String> {
+        let mut files = Vec::new();
+        for (set_index, params) in jobs {
+            let options = texturecraft_engine::file_cmds::export_options(&app.session, params, "file.exportTextures").map_err(|e| e.to_string())?;
+            files.extend(app.session.export_files(&[*set_index], &options).map_err(|e| e.to_string())?);
+        }
+
+        // Keep one file for each case-insensitive name in the download
+        texturecraft_engine::formats::skip_repeated_names(&mut files);
+        app.session.log.warnings("MapExporter", files.iter().flat_map(|file| file.warnings.iter().cloned()));
+        let file_count = files.len();
+
+        let name = match files.as_slice() {
+            [] => return Err("the preset produced no files".into()),
+            [f] => {
+                download(&f.name, &f.bytes)?;
+                f.name.clone()
+            }
+            _ => {
+                let name = format!("{}_textures.zip", sanitize_file_stem(&app.session.doc.project.name));
+                download(&name, &zip_files(files)?)?;
+                name
+            }
+        };
+
+        app.session.log.info("MapExporter", format!("Exported {file_count} textures ({name})"));
+        Ok(name)
+    }
+
+    /// Start a browser download of `bytes` named `name` (Blob + a temporary `<a download>`).
+    pub fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
+        let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
+        let window = web_sys::window().ok_or("no window")?;
+        let document = window.document().ok_or("no document")?;
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+        let opts = web_sys::BlobPropertyBag::new();
+        opts.set_type(if name.ends_with(".zip") { "application/zip" } else { "application/octet-stream" });
+        let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts).map_err(js)?;
+        let anchor: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor")?;
+        anchor.set_download(name);
+        anchor.style().set_property("display", "none").map_err(js)?;
+        let body = document.body().ok_or("no body")?;
+
+        let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
+        anchor.set_href(&url);
+        if let Err(error) = body.append_with_node_1(&anchor) {
+            let _ = web_sys::Url::revoke_object_url(&url);
+            return Err(js(error));
+        }
+
+        let download_url = url.clone();
+        let revoke = wasm_bindgen::closure::Closure::once(move || {
+            let _ = web_sys::Url::revoke_object_url(&download_url);
+        });
+
+        // The download keeps its own reference once the click dispatches
+        const DOWNLOAD_URL_LIFETIME_MS: i32 = 10_000;
+        if let Err(error) = window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.as_ref().unchecked_ref(), DOWNLOAD_URL_LIFETIME_MS) {
+            anchor.remove();
+            let _ = web_sys::Url::revoke_object_url(&url);
+            return Err(js(error));
+        }
+
+        // The timer owns the callback now, so release its Wasm reference slot
+        drop(revoke.into_js_value());
+        anchor.click();
+        anchor.remove();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use egui_kittest::Harness;
+
+    #[test]
+    fn mesh_picks_only_update_the_current_new_project_request() {
+        let session = Session::closed().unwrap();
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
+        let app = harness.state_mut();
+        crate::new_project_advanced::open(app);
+        app.ui.new_project.mesh_request_id = 2;
+
+        apply_picked(app, vec![("new.obj".into(), vec![2; 4096], Pick::NewProjectMesh(2)), ("stale.obj".into(), vec![1; 8192], Pick::NewProjectMesh(1))]);
+
+        assert_eq!(app.ui.new_project.file.as_deref(), Some("new.obj"));
+        assert_eq!(app.ui.new_project.file_bytes.as_deref().unwrap().as_slice(), &[2; 4096]);
+        let previous_buffer = std::sync::Arc::downgrade(app.ui.new_project.file_bytes.as_ref().unwrap());
+
+        crate::new_project_advanced::open(app);
+        apply_picked(app, vec![("previous.obj".into(), vec![3; 2048], Pick::NewProjectMesh(2))]);
+
+        assert!(app.ui.new_project.file.is_none());
+        assert!(app.ui.new_project.file_bytes.is_none());
+        assert!(previous_buffer.upgrade().is_none());
+    }
+
+    #[test]
+    fn environment_pick_after_close_does_not_edit_the_placeholder() {
+        let session = texturecraft_engine::sample_session(128, 32).unwrap();
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
+        let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
+        let old_project_id = harness.state().session.project_id;
+
+        assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
+
+        apply_picked(harness.state_mut(), vec![("environment.png".into(), png.clone(), Pick::Environment(old_project_id))]);
+
+        assert!(!harness.state().session.can_undo());
+        assert!(!harness.state().session.doc.resources.contains_key("environment.png"));
+
+        assert!(harness.state_mut().run("project.new", serde_json::json!({"mesh": "cube", "resolution": 128})).is_some());
+        let project_id = harness.state().session.project_id;
+
+        apply_picked(harness.state_mut(), vec![("environment.png".into(), png, Pick::Environment(project_id))]);
+
+        assert!(harness.state().session.doc.resources.contains_key("environment.png"));
+    }
+
+    #[test]
+    fn environment_pick_from_replaced_project_does_not_edit_the_new_project() {
+        let session = texturecraft_engine::sample_session(128, 32).unwrap();
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
+        let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
+        let old_project_id = harness.state().session.project_id;
+
+        assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
+        assert!(harness.state_mut().run("project.new", serde_json::json!({"mesh": "cube", "resolution": 128})).is_some());
+
+        apply_picked(harness.state_mut(), vec![("old-environment.png".into(), png, Pick::Environment(old_project_id))]);
+
+        assert!(!harness.state().session.doc.resources.contains_key("old-environment.png"));
+        assert!(!harness.state().session.modified);
+        assert!(!harness.state().session.can_undo());
+        assert!(harness.state().toasts.iter().any(|toast| toast.error));
+    }
+
+    #[test]
+    fn bake_mesh_picks_after_close_do_not_edit_the_placeholder() {
+        let session = texturecraft_engine::sample_session(128, 32).unwrap();
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
+        let old_project_id = harness.state().session.project_id;
+        assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
+        let cage = harness.state().session.mesh_obj_bytes().unwrap();
+
+        apply_picked(
+            harness.state_mut(),
+            vec![("high.obj".into(), cage.clone(), Pick::HighPoly(old_project_id)), ("cage.obj".into(), cage, Pick::Cage(old_project_id))],
+        );
+
+        assert!(harness.state().session.doc.bake_meshes.high.is_empty());
+        assert!(harness.state().session.doc.bake_meshes.cage.is_none());
+        assert!(!harness.state().session.modified);
+        assert_eq!(harness.state().toasts.iter().filter(|toast| toast.error).count(), 2);
+
+        assert!(harness.state_mut().run("project.new", serde_json::json!({"mesh": "cube", "resolution": 128})).is_some());
+        let project_id = harness.state().session.project_id;
+        let mesh = harness.state().session.mesh_obj_bytes().unwrap();
+
+        apply_picked(
+            harness.state_mut(),
+            vec![("high.obj".into(), mesh.clone(), Pick::HighPoly(project_id)), ("cage.obj".into(), mesh, Pick::Cage(project_id))],
+        );
+
+        assert_eq!(harness.state().session.doc.bake_meshes.high.len(), 1);
+        assert!(harness.state().session.doc.bake_meshes.cage.is_some());
+    }
+
+    #[test]
+    fn zip_round_trips_every_export_file() {
+        let file = |name: &str, bytes: &[u8]| ExportedFile { name: name.into(), bytes: bytes.to_vec(), width: 1, height: 1, warnings: Vec::new() };
+        let normal = [7u8; 4096];
+        let expected = [("z_BaseColor.png", b"one".as_slice()), ("a_Normal.png", normal.as_slice())];
+        let files = expected.iter().map(|(name, bytes)| file(name, bytes)).collect();
+
+        let bytes = zip_files(files).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_eq!(zip.len(), expected.len());
+        for (index, (name, expected_bytes)) in expected.into_iter().enumerate() {
+            let mut entry = zip.by_index(index).unwrap();
+            assert_eq!(entry.name().unwrap(), name);
+            assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+            let header = entry.header_start() as usize;
+            let name_len = u16::from_le_bytes(bytes[header + 26..header + 28].try_into().unwrap()) as usize;
+            let extra = header + 30 + name_len;
+            assert_eq!(&bytes[extra..extra + 4], &[1, 0, 16, 0], "expected a ZIP64 size extra field");
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+            assert_eq!(out, expected_bytes);
+        }
+    }
+}

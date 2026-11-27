@@ -1,0 +1,619 @@
+//! The `.tcraft` project file: a deflate zip holding
+//!
+//! | entry | content |
+//! |---|---|
+//! | `project.json` | serde JSON of [`Project`] |
+//! | `mesh.<ext>` | the original imported mesh file (absent for built-in meshes, `Project.mesh = "builtin:<id>"`) |
+//! | `uv_layout.bin` | the UV of every triangle corner of a mesh whose UVs were rebuilt (format 4+, see `uv_layout`) |
+//! | `highpoly/<name>` | a high-definition mesh file for baking, in list order |
+//! | `cage/<name>` | the baking cage mesh file |
+//! | `bake_paint/<ts>_<target>.bin` | cage or skew paint, stored as a one-component baked map |
+//! | `pixels/layer_<id>_<channelId>.bin` | painted pixels of a paint layer (or content paint effect) channel |
+//! | `pixels/mask_<id>.bin` | painted pixels of a mask paint effect |
+//! | `baked/<ts>_<mapId>.bin` | a baked mesh map of texture set `<ts>` |
+//! | `thumbnail.png` | optional preview supplied by the caller |
+//!
+//! Pixel `.bin` files are sparse and lossless: a header (magic `TCTX`, version, width, height,
+//! components, tile count; u32 LE each) followed, for every allocated 64×64 tile, by `tx`, `ty`
+//! (u32 LE) and the tile's raw `u16` LE components. Baked maps use the same header with a tile
+//! count of 0, followed by `width × height × components` f32 LE. Pixels of a UV-tiled texture
+//! set cover its whole atlas (`resolution` per tile, see `TileGrid`).
+
+use std::borrow::{Borrow, Cow};
+use std::collections::{BTreeMap, HashSet};
+use std::io::{Cursor, Read, Seek, Write};
+use std::sync::Arc;
+
+use texturecraft_compose::{BakedMaps, PixelStore};
+use texturecraft_core::project::REBUILT_MESH_UVS_VERSION;
+use texturecraft_core::{BakePaintTarget, BakedMap, Channel, FORMAT_VERSION, LayerId, Project, TANGENT_BENT_NORMAL_VERSION};
+use texturecraft_geom::glam::Vec2;
+use texturecraft_texel::{TILE_AREA, TileImage};
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+use self::entries::Entry;
+use self::load_budget::LoadBudget;
+use self::uv_layout::{MAX_UV_LAYOUT_BYTES, UV_LAYOUT_ENTRY, read_uv_layout, uv_layout_bytes, write_uv_layout};
+use crate::{FormatError, MAX_IMAGE_SIZE, Result, malformed};
+
+mod entries;
+mod load_budget;
+mod project_open_limit;
+mod ram_operation;
+mod ram_reservation;
+mod save_progress;
+mod uv_layout;
+#[cfg(not(target_arch = "wasm32"))]
+pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, configured_ram_budget, save_ram_budget, set_save_resources};
+pub use project_open_limit::{DEFAULT_PROJECT_OPEN_LIMIT_GIB, project_open_limit_gib, set_project_open_limit_gib};
+pub use ram_reservation::RamReservation;
+pub use save_progress::SaveProgress;
+
+const KIND: &str = "project file";
+#[cfg(test)]
+const MAGIC: &[u8; 4] = b"TCTX";
+#[cfg(test)]
+const BIN_VERSION: u32 = 1;
+#[cfg(test)]
+const BIN_HEADER_BYTES: usize = 24;
+const MAX_JSON: u64 = 256 << 20;
+const MAX_THUMBNAIL: u64 = 64 << 20;
+const MAX_RESOURCE: u64 = 512 << 20;
+const MAX_ENTRIES: usize = 100_000;
+/// Bound ZIP index parsing before the archive exposes its entry count.
+const MAX_ZIP_METADATA_BYTES: u64 = 32 << 20;
+/// Largest image (texels) of a texture set or baked map: UV-tiled sets hold several tiles.
+const MAX_TEXELS: u64 = 1 << 28;
+
+mod bake_paint_data;
+mod recovery;
+pub use bake_paint_data::BakePaintData;
+
+/// Everything a project file holds.
+#[derive(Clone, Debug)]
+pub struct ProjectFile<Resource = Vec<u8>, MeshBytes = Vec<u8>> {
+    pub project: Project,
+    pub pixels: PixelStore,
+    /// Baked mesh maps per texture set index.
+    pub baked: BTreeMap<usize, BakedMaps>,
+    /// Original mesh file: (extension, bytes).
+    pub mesh: Option<(String, MeshBytes)>,
+    /// Saved UV layout of `mesh` when its UVs were rebuilt: the UV of every triangle corner, in
+    /// index order, as the mesh was first imported.
+    pub mesh_uvs: Option<Vec<Vec2>>,
+    /// High-definition mesh files for baking: (file name, bytes). Names are
+    /// [`sanitize_resource_name`]d on save.
+    pub high_poly: Vec<(String, MeshBytes)>,
+    /// Baking cage mesh file: (file name, bytes).
+    pub cage: Option<(String, MeshBytes)>,
+    pub bake_paint: BTreeMap<(usize, BakePaintTarget), BakePaintData>,
+    pub thumbnail: Option<Vec<u8>>,
+    /// Imported resources (images used by fills, alphas, stencils), by name: original bytes.
+    pub resources: BTreeMap<String, Resource>,
+    /// Import warnings for the caller's log; never saved in the archive
+    pub warnings: Vec<String>,
+}
+
+impl<Resource, MeshBytes> ProjectFile<Resource, MeshBytes> {
+    /// Check that the mesh source and the rebuild setting agree with the saved layout.
+    pub fn validate_mesh_uvs(&self) -> Result<()> {
+        if self.project.mesh_rebuild_uvs != self.mesh_uvs.is_some() {
+            return Err(malformed(KIND, format!("{UV_LAYOUT_ENTRY} is required exactly when mesh UVs were rebuilt")));
+        }
+
+        if self.mesh_uvs.is_some() && (self.mesh.is_none() || self.project.mesh.starts_with("builtin:")) {
+            return Err(malformed(KIND, format!("{UV_LAYOUT_ENTRY} requires a stored mesh")));
+        }
+
+        Ok(())
+    }
+}
+
+/// Maximum length of a resource name after sanitization.
+pub const MAX_RESOURCE_NAME_LEN: usize = 120;
+
+/// A resource name safe as a zip entry and a file name: `[A-Za-z0-9_.-]`, at most 120 chars.
+pub fn sanitize_resource_name(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' }).take(MAX_RESOURCE_NAME_LEN).collect();
+    let s = s.trim_start_matches('.').to_string();
+    if s.is_empty() { "resource".into() } else { s }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Save.
+
+pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>> {
+    RamReservation::for_save()?.save_bytes(pf)
+}
+
+/// Save atomically through a newly created temporary file beside `path`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_project(path: &std::path::Path, project_file: &ProjectFile) -> Result<()> {
+    RamReservation::for_save()?.save(path, project_file)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_project_atomic(
+    path: &std::path::Path,
+    project_file: &ProjectFile<impl Borrow<Vec<u8>>, impl Borrow<Vec<u8>>>,
+    progress: Option<&SaveProgress>,
+) -> Result<()> {
+    let (temporary_path, file) = crate::create_temp(path)?;
+    let result = (|| -> Result<()> {
+        let mut file = std::io::BufWriter::new(file);
+        write_project(&mut file, project_file, progress)?;
+        file.into_inner().map_err(|error| error.into_error())?.sync_all()?;
+        std::fs::rename(&temporary_path, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+
+    result
+}
+
+fn zip_err(e: zip::result::ZipError) -> FormatError {
+    match e {
+        zip::result::ZipError::Io(e) => FormatError::Io(e),
+        e => malformed(KIND, e),
+    }
+}
+
+#[cfg(test)]
+fn header(w: u32, h: u32, comps: usize, count: usize) -> Vec<u8> {
+    let mut b = MAGIC.to_vec();
+    for v in [BIN_VERSION, w, h, comps as u32, count as u32] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+fn codec_write_error(error: craft_tcraft::Error) -> std::io::Error {
+    match error {
+        craft_tcraft::Error::Io(error) => error,
+        other => std::io::Error::other(other),
+    }
+}
+
+fn write_tiles(w: &mut impl Write, img: &TileImage) -> std::io::Result<()> {
+    let layout = craft_tcraft::Layout { width: img.width(), height: img.height(), components: img.comps() };
+    let count = u32::try_from(img.allocated_count()).map_err(std::io::Error::other)?;
+    let tiles = img.allocated().map(|(x, y)| (x, y, img.tile(x, y).unwrap_or_default()));
+    craft_tcraft::write_tiles(w, layout, count, tiles).map_err(codec_write_error)
+}
+
+/// Keep `[a-z0-9]`, at most 8 characters (the mesh entry's extension).
+fn sanitize_ext(ext: &str) -> String {
+    let e: String = ext.trim_start_matches('.').chars().filter(char::is_ascii_alphanumeric).take(8).collect::<String>().to_ascii_lowercase();
+    if e.is_empty() { "bin".into() } else { e }
+}
+
+/// The sanitized `name`, with a numeric suffix before the extension when `used` already holds it.
+fn unique_entry_name(dir: &str, name: &str, used: &mut HashSet<String>) -> String {
+    let base = sanitize_resource_name(name);
+    let mut entry = format!("{dir}/{base}");
+    let mut n = 2u32;
+    while !used.insert(entry.clone()) {
+        let (stem, ext) = match base.rfind('.') {
+            Some(i) if i > 0 => base.split_at(i),
+            _ => (base.as_str(), ""),
+        };
+        entry = format!("{dir}/{stem}_{n}{ext}");
+        n += 1;
+    }
+    entry
+}
+
+#[cfg(test)]
+const BAKED_CHUNK: usize = 1 << 16;
+
+fn write_baked(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &[f32]) -> std::io::Result<()> {
+    let layout = craft_tcraft::Layout { width: res, height: h, components: comps };
+    craft_tcraft::write_baked(w, layout, data).map_err(codec_write_error)
+}
+
+/// The zip entries of a project file, in file order. Bodies run later, possibly on other threads.
+fn entries(project_file: &ProjectFile<impl Borrow<Vec<u8>>, impl Borrow<Vec<u8>>>) -> Result<Vec<Entry<'_>>> {
+    project_file.validate_mesh_uvs()?;
+
+    let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut project = Cow::Borrowed(&project_file.project);
+
+    // Callers can supply a document directly instead of a versioned save snapshot
+    let version = project.save_format_version();
+    if project.format_version != version {
+        project.to_mut().format_version = version;
+    }
+
+    let json = serde_json::to_vec_pretty(project.as_ref()).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    let mut out = vec![Entry { name: "project.json".into(), options: deflate, weight: json.len() as u64, body: Box::new(move |w| w.write_all(&json)) }];
+
+    if let Some((ext, bytes)) = &project_file.mesh {
+        let bytes = bytes.borrow();
+        out.push(Entry {
+            name: format!("mesh.{}", sanitize_ext(ext)),
+            options: deflate,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
+    }
+
+    if let Some(layout) = &project_file.mesh_uvs {
+        out.push(Entry {
+            name: UV_LAYOUT_ENTRY.into(),
+            options: deflate,
+            weight: uv_layout_bytes(layout.len()),
+            body: Box::new(move |w| write_uv_layout(w, layout)),
+        });
+    }
+
+    let mut used = HashSet::new();
+    for (dir, (name, bytes)) in project_file.high_poly.iter().map(|m| ("highpoly", m)).chain(project_file.cage.iter().map(|m| ("cage", m))) {
+        let bytes = bytes.borrow();
+        out.push(Entry {
+            name: unique_entry_name(dir, name, &mut used),
+            options: deflate,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
+    }
+
+    for ((texture_set, target), map) in &project_file.bake_paint {
+        if map.width == 0 || map.height == 0 || map.values.len() as u64 != u64::from(map.width) * u64::from(map.height) {
+            return Err(FormatError::Invalid("bake paint map dimensions do not match its values".into()));
+        }
+
+        let target_name = match target {
+            BakePaintTarget::Cage => "cage",
+            BakePaintTarget::Skew => "skew",
+        };
+
+        out.push(Entry {
+            name: format!("bake_paint/{texture_set}_{target_name}.bin"),
+            options: deflate,
+            weight: map.values.len() as u64 * 4,
+            body: Box::new(move |w| write_baked(w, map.width, map.height, 1, &map.values)),
+        });
+    }
+
+    let mut layers: Vec<_> = project_file.pixels.layers.iter().collect();
+    layers.sort_by_key(|(k, _)| **k);
+    for ((id, c), img) in layers {
+        let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
+        out.push(Entry {
+            name: format!("pixels/layer_{}_{}.bin", id.0, c.id()),
+            options: deflate,
+            weight,
+            body: Box::new(move |mut w| write_tiles(&mut w, img)),
+        });
+    }
+
+    let mut masks: Vec<_> = project_file.pixels.masks.iter().collect();
+    masks.sort_by_key(|(k, _)| **k);
+    for (id, img) in masks {
+        let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
+        out.push(Entry { name: format!("pixels/mask_{}.bin", id.0), options: deflate, weight, body: Box::new(move |mut w| write_tiles(&mut w, img)) });
+    }
+    for (ts, maps) in &project_file.baked {
+        let r = maps.resolution;
+        for (m, data) in &maps.maps {
+            // Skip inconsistent maps so the saved project can reopen and bake them again
+            let h = maps.height(*m);
+            if h == 0 || data.len() != (r as usize) * (h as usize) * m.components() {
+                continue;
+            }
+
+            let comps = m.components();
+            out.push(Entry {
+                name: format!("baked/{ts}_{}.bin", m.id()),
+                options: deflate,
+                weight: data.len() as u64 * 4,
+                body: Box::new(move |w| write_baked(w, r, h, comps, data)),
+            });
+        }
+    }
+
+    if let Some(png) = &project_file.thumbnail {
+        out.push(Entry { name: "thumbnail.png".into(), options: stored, weight: png.len() as u64, body: Box::new(move |w| w.write_all(png)) });
+    }
+
+    used.clear();
+    for (name, resource) in &project_file.resources {
+        let bytes = resource.borrow();
+        out.push(Entry {
+            name: unique_entry_name("resources", name, &mut used),
+            options: stored,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
+    }
+
+    Ok(out)
+}
+
+fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile<impl Borrow<Vec<u8>>, impl Borrow<Vec<u8>>>, progress: Option<&SaveProgress>) -> Result<()> {
+    let mut zip = ZipWriter::new(out);
+    let mut entries = entries(pf)?;
+    if let Some(progress) = progress {
+        progress.track(&mut entries);
+    }
+    entries::write_entries(&mut zip, entries)?;
+    zip.finish().map_err(zip_err)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Load.
+
+pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile> {
+    crate::guard(KIND, || load(Cursor::new(bytes)))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_project(path: &std::path::Path) -> Result<ProjectFile> {
+    let file = std::fs::File::open(path)?;
+    crate::guard(KIND, || load(std::io::BufReader::new(file)))
+}
+
+/// Read a native smart material in place. MaterialCraft packages go to the bounded cook reader.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_smart_material_project(file: std::fs::File) -> Result<Option<ProjectFile>> {
+    crate::guard(KIND, || {
+        let archive = open_archive(std::io::BufReader::new(file), MAX_ZIP_METADATA_BYTES)?;
+        if archive.index_for_name(craft_mcmat::MANIFEST_ENTRY).is_some()
+            || archive.index_for_name("package.json").is_some()
+            || archive.file_names().any(|name| name.is_ok_and(|name| crate::mcmat::is_root_sbs(&name)))
+        {
+            return Ok(None);
+        }
+
+        let budget = LoadBudget::new(u64::from(project_open_limit_gib()) << 30);
+        load_archive(archive, budget).map(Some)
+    })
+}
+
+fn read_all(reader: &mut impl Read, cap: u64, budget: &mut LoadBudget, what: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+
+    // Read at most one byte beyond either limit to detect overflow without a full entry allocation
+    let read_limit = cap.min(budget.remaining()).saturating_add(1);
+    reader.take(read_limit).read_to_end(&mut out).map_err(|e| malformed(KIND, format!("{what}: {e}")))?;
+    if out.len() as u64 > cap {
+        return Err(FormatError::TooLarge(format!("{what} is larger than {cap} bytes")));
+    }
+
+    budget.take(out.len() as u64).map_err(FormatError::TooLarge)?;
+    Ok(out)
+}
+
+/// Transfer the bytes charged by the shared codec to this project's one load budget.
+fn codec_result<T>(result: std::result::Result<T, craft_tcraft::Error>, shared: &craft_zip::Budget, budget: &mut LoadBudget, what: &str) -> Result<T> {
+    budget.take(shared.used()).map_err(FormatError::TooLarge)?;
+    result.map_err(|error| match error {
+        craft_tcraft::Error::Budget(_) => FormatError::TooLarge(budget.exceeded_message()),
+        craft_tcraft::Error::Limit(message) => FormatError::TooLarge(format!("{what}: {message}")),
+        craft_tcraft::Error::NewerVersion(found) => FormatError::NewerVersion { found, supported: craft_tcraft::VERSION },
+        other => malformed(KIND, format!("{what}: {other}")),
+    })
+}
+
+fn read_tiles(reader: &mut impl Read, size: (u32, u32), components: usize, budget: &mut LoadBudget, what: &str) -> Result<TileImage> {
+    let layout = craft_tcraft::Layout { width: size.0, height: size.1, components };
+    let mut shared = craft_zip::Budget::new("project", budget.remaining());
+    let mut image = None;
+    let result = craft_tcraft::read_tiles(reader, layout, MAX_TEXELS, &mut shared, |x, y, values| {
+        image.get_or_insert_with(|| TileImage::new(size.0, size.1, components)).set_tile(x, y, Some(Arc::new(values)));
+        Ok(())
+    });
+    codec_result(result, &shared, budget, what)?;
+    Ok(image.unwrap_or_else(|| TileImage::new(size.0, size.1, components)))
+}
+
+fn read_baked(reader: &mut impl Read, declared_bytes: u64, components: usize, budget: &mut LoadBudget, what: &str) -> Result<(u32, u32, Vec<f32>)> {
+    let mut shared = craft_zip::Budget::new("project", budget.remaining());
+    let result = craft_tcraft::read_baked(reader, declared_bytes, components, MAX_TEXELS, &mut shared);
+    let (layout, values) = codec_result(result, &shared, budget, what)?;
+    Ok((layout.width, layout.height, values))
+}
+
+/// Texture set holding a paint layer, a content effect or a mask effect id.
+fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
+    let owner = if project.layers.contains_key(&id) { id } else { project.effect(id)?.0 };
+    project.locate(owner).map(|(ts, _, _)| ts)
+}
+
+fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
+    let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+    load_with_budget(reader, LoadBudget::new(limit_bytes))
+}
+
+fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64) -> Result<()> {
+    craft_zip::inspect_seekable(zip, MAX_ENTRIES, limit_bytes).map_err(|error| match error {
+        craft_zip::InspectError::TooManyEntries { .. } => FormatError::TooLarge(format!("project file has more than {MAX_ENTRIES} entries")),
+        craft_zip::InspectError::DeclaredBytesExceeded { .. } => FormatError::TooLarge(LoadBudget::new(limit_bytes).exceeded_message()),
+        craft_zip::InspectError::OverlappingEntries => malformed(KIND, "overlapping ZIP entries are not supported"),
+        craft_zip::InspectError::Zip(error) => zip_err(error),
+    })
+}
+
+fn open_archive<R: Read + Seek>(reader: R, metadata_bytes: u64) -> Result<ZipArchive<craft_zip::MetadataReader<R>>> {
+    let (reader, indexing) = craft_zip::MetadataReader::new(reader, metadata_bytes)?;
+    // Project archives start at byte zero; avoid scanning payloads to guess an embedded ZIP offset
+    let config = zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) };
+    let archive = ZipArchive::with_config(config, reader).map_err(zip_err)?;
+    indexing.finish();
+    Ok(archive)
+}
+
+fn load_with_budget<R: Read + Seek>(reader: R, budget: LoadBudget) -> Result<ProjectFile> {
+    load_archive(open_archive(reader, MAX_ZIP_METADATA_BYTES)?, budget)
+}
+
+fn load_archive<R: Read + Seek>(mut zip: ZipArchive<R>, mut budget: LoadBudget) -> Result<ProjectFile> {
+    check_archive(&mut zip, budget.remaining())?;
+
+    let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, &mut budget, "project.json")?;
+    let version = craft_tcraft::project_version(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
+    if version > FORMAT_VERSION {
+        return Err(FormatError::NewerVersion { found: version, supported: FORMAT_VERSION });
+    }
+
+    let (project, mut recovered) = recovery::read_project(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
+    project.validate()?;
+    let too_large = |t: &texturecraft_core::TextureSet| u64::from(t.size().0) * u64::from(t.size().1) > MAX_TEXELS;
+    if let Some(ts) = project.texture_sets.iter().find(|t| t.resolution == 0 || t.resolution > MAX_IMAGE_SIZE || too_large(t)) {
+        return Err(malformed(KIND, format!("texture set \"{}\" has resolution {} over {} UV tiles", ts.name, ts.resolution, ts.uv_tiles.len().max(1))));
+    }
+
+    let mut project_file = ProjectFile {
+        pixels: PixelStore::default(),
+        baked: BTreeMap::new(),
+        mesh: None,
+        mesh_uvs: None,
+        high_poly: Vec::new(),
+        cage: None,
+        bake_paint: BTreeMap::new(),
+        thumbnail: None,
+        resources: BTreeMap::new(),
+        warnings: Vec::new(),
+        project,
+    };
+
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index).map_err(zip_err)?;
+        let declared_bytes = entry.size();
+        let name = entry.name().map_err(zip_err)?.into_owned();
+        let size_of = |id: LayerId| texture_set_of(&project_file.project, id).and_then(|ts| project_file.project.texture_sets.get(ts)).map(|t| t.size());
+
+        // Unrecognized entries from newer minor revisions may be skipped
+        if name == "thumbnail.png" {
+            project_file.thumbnail = Some(read_all(&mut entry, MAX_THUMBNAIL, &mut budget, &name)?);
+        } else if let Some(res_name) = name.strip_prefix("resources/") {
+            if res_name.is_empty() || sanitize_resource_name(res_name) != res_name {
+                return Err(malformed(KIND, format!("bad resource name {name}")));
+            }
+
+            let bytes = read_all(&mut entry, MAX_RESOURCE, &mut budget, &name)?;
+            project_file.resources.insert(res_name.to_string(), bytes);
+        } else if let Some((dir, file)) = name.split_once('/').filter(|(d, _)| *d == "highpoly" || *d == "cage") {
+            if file.is_empty() || sanitize_resource_name(file) != file {
+                return Err(malformed(KIND, format!("bad mesh name {name}")));
+            }
+
+            let entry = (file.to_string(), read_all(&mut entry, crate::mesh_import::MAX_MESH_FILE_BYTES, &mut budget, &name)?);
+            match dir {
+                "cage" => project_file.cage = Some(entry),
+                _ => project_file.high_poly.push(entry),
+            }
+        } else if let Some(rest) = name.strip_prefix("bake_paint/").and_then(|name| name.strip_suffix(".bin")) {
+            let (texture_set, target) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry {name}")))?;
+            let texture_set: usize = texture_set.parse().map_err(|_| malformed(KIND, format!("bad entry {name}")))?;
+            if texture_set >= project_file.project.texture_sets.len() {
+                return Err(malformed(KIND, format!("unknown texture set in {name}")));
+            }
+
+            let target = match target {
+                "cage" => BakePaintTarget::Cage,
+                "skew" => BakePaintTarget::Skew,
+                _ => return Err(malformed(KIND, format!("unknown bake paint target in {name}"))),
+            };
+            let (width, height, values) = read_baked(&mut entry, declared_bytes, 1, &mut budget, &name)?;
+            project_file.bake_paint.insert((texture_set, target), BakePaintData { width, height, values });
+        } else if let Some(ext) = name.strip_prefix("mesh.").filter(|e| !e.contains('/')) {
+            let bytes = read_all(&mut entry, crate::mesh_import::MAX_MESH_FILE_BYTES, &mut budget, &name)?;
+            project_file.mesh = Some((ext.to_string(), bytes));
+        } else if name == UV_LAYOUT_ENTRY {
+            if version < REBUILT_MESH_UVS_VERSION || !project_file.project.mesh_rebuild_uvs {
+                return Err(malformed(KIND, format!("{UV_LAYOUT_ENTRY} requires format {REBUILT_MESH_UVS_VERSION} or later and rebuilt mesh UVs")));
+            }
+
+            if declared_bytes > MAX_UV_LAYOUT_BYTES {
+                return Err(FormatError::TooLarge(format!("{UV_LAYOUT_ENTRY} is larger than {MAX_UV_LAYOUT_BYTES} bytes")));
+            }
+
+            budget.take(declared_bytes).map_err(FormatError::TooLarge)?;
+            project_file.mesh_uvs = Some(read_uv_layout(&mut entry, declared_bytes)?);
+        } else if let Some(rest) = name.strip_prefix("pixels/layer_").and_then(|r| r.strip_suffix(".bin")) {
+            let (id, chan) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
+            let id = LayerId(id.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
+            let c = Channel::ALL.into_iter().find(|c| c.id() == chan).ok_or_else(|| malformed(KIND, format!("unknown channel in {name}")))?;
+
+            // Drop pixels of layers that are no longer in any stack
+            let Some(size) = size_of(id) else { continue };
+
+            let img = read_tiles(&mut entry, size, c.components() + 1, &mut budget, &name)?;
+            project_file.pixels.layers.insert((id, c), img);
+        } else if let Some(rest) = name.strip_prefix("pixels/mask_").and_then(|r| r.strip_suffix(".bin")) {
+            let id = LayerId(rest.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
+            let Some(size) = size_of(id) else { continue };
+
+            let img = read_tiles(&mut entry, size, 2, &mut budget, &name)?;
+            project_file.pixels.masks.insert(id, img);
+        } else if let Some(rest) = name.strip_prefix("baked/").and_then(|r| r.strip_suffix(".bin")) {
+            let (ts, map) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
+            let ts: usize = ts.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?;
+            let Some(m) = recovery::baked_map(map) else {
+                recovered = true;
+                continue;
+            };
+
+            if ts >= project_file.project.texture_sets.len() {
+                continue;
+            }
+
+            let (res, height, data) = read_baked(&mut entry, declared_bytes, m.components(), &mut budget, &name)?;
+            let maps = project_file.baked.entry(ts).or_default();
+            if maps.maps.is_empty() {
+                maps.resolution = res;
+            } else if maps.resolution != res || maps.maps.keys().next().is_some_and(|k| maps.height(*k) != height) {
+                return Err(malformed(KIND, format!("{name}: baked maps of one texture set differ in size")));
+            }
+
+            maps.maps.insert(m, Arc::new(data));
+        }
+    }
+
+    // Rerunning the unwrapper could lay the saved paint over a different layout
+    project_file.validate_mesh_uvs()?;
+
+    if version < TANGENT_BENT_NORMAL_VERSION {
+        drop_world_space_bent_normals(&mut project_file);
+    }
+
+    project_file.project.format_version = version.max(TANGENT_BENT_NORMAL_VERSION);
+
+    if recovered {
+        project_file.warnings.push(
+            "Warning: Some project settings or mesh maps could not be imported. TextureCraft recovered what it could, using defaults where needed.".into(),
+        );
+    }
+
+    Ok(project_file)
+}
+
+/// Older files hold bent normal maps in world space, which every reader now takes as tangent
+/// space: drop them (the bake settings stay) and ask for a re-bake.
+fn drop_world_space_bent_normals(pf: &mut ProjectFile) {
+    // Pixels and declaration go for every set, either one alone is enough to name the set in the warning
+    let mut names = Vec::new();
+    for (i, set) in pf.project.texture_sets.iter_mut().enumerate() {
+        let had_pixels = pf.baked.get_mut(&i).is_some_and(|maps| maps.maps.remove(&BakedMap::BentNormal).is_some());
+        if set.baked.remove(&BakedMap::BentNormal) || had_pixels {
+            names.push(format!("\"{}\"", set.name));
+        }
+    }
+    pf.baked.retain(|_, maps| !maps.maps.is_empty());
+    if !names.is_empty() {
+        pf.warnings.push(format!(
+            "Warning: This project was saved with bent normal maps in world space. TextureCraft now bakes them in tangent space and removed the old ones from texture set {}. Bake the Bent Normals map again, or set its image again if it came from a file.",
+            names.join(", ")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests;
